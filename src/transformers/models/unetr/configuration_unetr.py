@@ -15,7 +15,7 @@
 """ UNETR model configuration"""
 
 from collections import OrderedDict
-from typing import Mapping
+from typing import Mapping, Tuple, Union
 
 from packaging import version
 
@@ -107,6 +107,8 @@ class UNETRConfig(PretrainedConfig):
         num_channels=3,
         qkv_bias=True,
         encoder_stride=16,
+        norm_name: Union[Tuple, str]="instance",
+        res_block=True,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -125,6 +127,8 @@ class UNETRConfig(PretrainedConfig):
         self.num_channels = num_channels
         self.qkv_bias = qkv_bias
         self.encoder_stride = encoder_stride
+        self.norm_name = norm_name
+        self.res_block = res_block
 
 
 class UNETROnnxConfig(OnnxConfig):
