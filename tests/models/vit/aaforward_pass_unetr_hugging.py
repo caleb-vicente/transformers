@@ -1,21 +1,23 @@
+import os
 import argparse
-from transformers import ViTModel, UNETRConfig
+from transformers import UNETRModel, UNETRConfig, UNETRFor3DImageSegmentation
 import torch
 
 
 config = UNETRConfig()
-model = ViTModel(config, add_pooling_layer=False, use_mask_token=True)
+#model = UNETRModel(config, add_pooling_layer=False, use_mask_token=True)
+model = UNETRFor3DImageSegmentation(config)
 
 # Import 3D images for Unetr
 # ----------------------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="UNETR segmentation pipeline")
 parser.add_argument(
-    "--pretrained_dir", default="C:/Users/caleb/Documents/projects/open_source/btcv/", type=str, help="pretrained checkpoint directory"
+    "--pretrained_dir", default="/home/caleb/Downloads/unetr_data", type=str, help="pretrained checkpoint directory"
 )
 parser.add_argument("--data_dir", default="C:/Users/caleb/Documents/projects/open_source/btcv/", type=str, help="dataset directory")
 parser.add_argument("--json_list", default="dataset_0.json", type=str, help="dataset json file")
 parser.add_argument(
-    "--pretrained_model_name", default="UNETR_model_best_acc.pth", type=str, help="pretrained model name"
+    "--pretrained_model_name", default="UNETR_model_best_acc_hugging_face.pth", type=str, help="pretrained model name"
 )
 parser.add_argument(
     "--saved_checkpoint", default="ckpt", type=str, help="Supports torchscript or ckpt pretrained checkpoint type"
@@ -51,14 +53,22 @@ parser.add_argument("--norm_name", default="instance", type=str, help="normaliza
 args = parser.parse_args()
 args.test_mode = True
 
-inputs = torch.load('C:/Users/caleb/Documents/projects/open_source/btcv/image_tensor_val/image_val_post_procesing0.pt')
+inputs = torch.load('/home/caleb/Downloads/unetr_data/image_val_post_procesing0.pt')
 # # ----------------------------------------------------------------------------------------
 
 # inputs = feature_extractor(image, return_tensors="pt")
 
 with torch.no_grad():
     #logits = model(**inputs).logits
-    logits = model(inputs)
+    args = parser.parse_args()
+    args.test_mode = True
+    pretrained_dir = args.pretrained_dir
+    model_name = args.pretrained_model_name
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pretrained_pth = os.path.join(pretrained_dir, model_name)
+    model_dict = torch.load(pretrained_pth, map_location=device)
+    model.load_state_dict(model_dict)
+    logits = model(inputs, output_hidden_states=True)
 
 # model predicts one of the 1000 ImageNet classes
 predicted_label = logits.argmax(-1).item()

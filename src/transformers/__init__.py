@@ -2058,6 +2058,7 @@ else:
             "UNETRForMaskedImageModeling",
             "UNETRModel",
             "UNETRPreTrainedModel",
+            "UNETRFor3DImageSegmentation",
         ]
     )
     _import_structure["models.vit_mae"].extend(
@@ -4809,6 +4810,7 @@ if TYPE_CHECKING:
             UNETRForMaskedImageModeling,
             UNETRModel,
             UNETRPreTrainedModel,
+            UNETRFor3DImageSegmentation,
         )
         from .models.vit_mae import (
             VIT_MAE_PRETRAINED_MODEL_ARCHIVE_LIST,

@@ -38,6 +38,7 @@ else:
         "UNETRForMaskedImageModeling",
         "UNETRModel",
         "UNETRPreTrainedModel",
+        "UNETRFor3DImageSegmentation",
     ]
 
 if TYPE_CHECKING:
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
             UNETRForMaskedImageModeling,
             UNETRModel,
             UNETRPreTrainedModel,
+            UNETRFor3DImageSegmentation,
         )
 
 else:

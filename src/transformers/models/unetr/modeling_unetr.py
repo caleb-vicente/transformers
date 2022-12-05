@@ -14,17 +14,21 @@
 # limitations under the License.
 """ PyTorch UNETR model."""
 
-
+import numpy as np
 import collections.abc
 import math
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union, Sequence
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from monai.networks.blocks import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock #TODO: This blocks should not be imported from monai
-from monai.networks.blocks.dynunet_block import UnetOutBlock                    #TODO: Uninstall monai, not necessary in requirements
+
+# TODO: Remove monai dependences
+from monai.utils import optional_import
+from monai.networks.blocks import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock
+from monai.networks.blocks.dynunet_block import UnetOutBlock
+
 
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ImageClassifierOutput, MaskedLMOutput
@@ -39,6 +43,7 @@ from ...utils import (
 )
 from .configuration_unetr import UNETRConfig
 
+Rearrange, _ = optional_import("einops.layers.torch", name="Rearrange")
 
 logger = logging.get_logger(__name__)
 
@@ -74,18 +79,18 @@ class UNETREmbeddings(nn.Module):
         self.cls_token = nn.Parameter(
             nn.init.trunc_normal_(torch.zeros(1, 1, config.hidden_size), mean=0.0, std=config.initializer_range)
         )
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size)) if use_mask_token else None
         self.patch_embeddings = UNETRPatchEmbeddings(config)
         num_patches = self.patch_embeddings.num_patches
         self.position_embeddings = nn.Parameter(
             nn.init.trunc_normal_(
-                torch.zeros(1, num_patches + 1, config.hidden_size), mean=0.0, std=config.initializer_range
+                torch.zeros(1, num_patches, config.hidden_size), mean=0.0, std=config.initializer_range
             )
         )
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.config = config
 
     def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        # TODO: For Unetr, I would say this method is totally unnecessary.
         """
         This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher
         resolution images.
@@ -124,25 +129,10 @@ class UNETREmbeddings(nn.Module):
         bool_masked_pos: Optional[torch.BoolTensor] = None,
         interpolate_pos_encoding: bool = False,
     ) -> torch.Tensor:
-        batch_size, num_channels, height, width = pixel_values.shape
-        embeddings = self.patch_embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        batch_size, num_channels, height, width, depth = pixel_values.shape
+        embeddings = self.patch_embeddings(pixel_values)
 
-        if bool_masked_pos is not None:
-            seq_length = embeddings.shape[1]
-            mask_tokens = self.mask_token.expand(batch_size, seq_length, -1)
-            # replace the masked visual tokens by mask_tokens
-            mask = bool_masked_pos.unsqueeze(-1).type_as(mask_tokens)
-            embeddings = embeddings * (1.0 - mask) + mask_tokens * mask
-
-        # add the [CLS] token to the embedded patch tokens
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        embeddings = torch.cat((cls_tokens, embeddings), dim=1)
-
-        # add positional encoding to each token
-        if interpolate_pos_encoding:
-            embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
-        else:
-            embeddings = embeddings + self.position_embeddings
+        embeddings = embeddings + self.position_embeddings
 
         embeddings = self.dropout(embeddings)
 
@@ -162,29 +152,42 @@ class UNETRPatchEmbeddings(nn.Module):
         image_size, patch_size = config.image_size, config.patch_size
         num_channels, hidden_size = config.num_channels, config.hidden_size
 
-        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
-        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
-        num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
+        #TODO: Add an exception, if in the Iterable patch size or patch size, all sizes are not the same
+        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size, image_size)
+        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size, patch_size)
+        num_patches = (image_size[2] // patch_size[2]) * (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.num_patches = num_patches
+        self.patch_dim = num_channels * np.prod(patch_size)
 
-        self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+        #self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+        chars = (("h", "p1"), ("w", "p2"), ("d", "p3"))[:config.spatial_dims]
+        from_chars = "b c " + " ".join(f"({k} {v})" for k, v in chars)
+        to_chars = f"b ({' '.join([c[0] for c in chars])}) ({' '.join([c[1] for c in chars])} c)"
+        axes_len = {f"p{i + 1}": p for i, p in enumerate(self.patch_size)}
+        self.projection = nn.Sequential(
+            Rearrange(f"{from_chars} -> {to_chars}", **axes_len),
+            nn.Linear(self.patch_dim, hidden_size),
+        )
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False) -> torch.Tensor:
-        batch_size, num_channels, height, width = pixel_values.shape
-        if num_channels != self.num_channels:
-            raise ValueError(
-                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
-            )
-        if not interpolate_pos_encoding:
-            if height != self.image_size[0] or width != self.image_size[1]:
-                raise ValueError(
-                    f"Input image size ({height}*{width}) doesn't match model"
-                    f" ({self.image_size[0]}*{self.image_size[1]})."
-                )
-        embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
+        # batch_size, num_channels, height, width, depth = pixel_values.shape
+        # # TODO: Review how the ValueErrors are risen
+        # if num_channels != self.num_channels:
+        #     raise ValueError(
+        #         "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
+        #     )
+        # if not interpolate_pos_encoding:
+        #     if height != self.image_size[0] or width != self.image_size[1]:
+        #         raise ValueError(
+        #             f"Input image size ({height}*{width}) doesn't match model"
+        #             f" ({self.image_size[0]}*{self.image_size[1]})."
+        #         )
+        # #embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
+        embeddings = self.projection(pixel_values)
+
         return embeddings
 
 
@@ -335,6 +338,7 @@ class UNETROutput(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
@@ -354,8 +358,8 @@ class UNETRLayer(nn.Module):
         self.attention = UNETRAttention(config)
         self.intermediate = UNETRIntermediate(config)
         self.output = UNETROutput(config)
-        self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.layernorm_after = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm_before = nn.LayerNorm(config.hidden_size)
+        self.layernorm_after = nn.LayerNorm(config.hidden_size)
 
     def forward(
         self,
@@ -393,6 +397,7 @@ class UNETREncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([UNETRLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self.norm_last_layer = nn.LayerNorm(config.hidden_size)
 
     def forward(
         self,
@@ -405,14 +410,13 @@ class UNETREncoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        for i, layer_module in enumerate(self.layer):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+        hidden_states_out = []
 
+        for i, layer_module in enumerate(self.layer):
+            # todo: in the unetr code where do we implement the mask?
             layer_head_mask = head_mask[i] if head_mask is not None else None
 
             if self.gradient_checkpointing and self.training:
-
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(*inputs, output_attentions)
@@ -425,15 +429,16 @@ class UNETREncoder(nn.Module):
                     layer_head_mask,
                 )
             else:
-                layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions)
+                    layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions)
 
             hidden_states = layer_outputs[0]
-
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_hidden_states = all_hidden_states + (self.norm_last_layer(hidden_states),)
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
@@ -520,7 +525,6 @@ class UNETRModel(UNETRPreTrainedModel):
         self.embeddings = UNETREmbeddings(config, use_mask_token=use_mask_token)
         self.encoder = UNETREncoder(config)
 
-        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.pooler = UNETRPooler(config) if add_pooling_layer else None
 
         # Initialize weights and apply final processing
@@ -584,7 +588,6 @@ class UNETRModel(UNETRPreTrainedModel):
             return_dict=return_dict,
         )
         sequence_output = encoder_outputs[0]
-        sequence_output = self.layernorm(sequence_output)
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
 
         if not return_dict:
@@ -614,239 +617,19 @@ class UNETRPooler(nn.Module):
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
-
-# @add_start_docstrings(
-#     """UNETR Model with a decoder on top for masked image modeling, as proposed in [SimMIM](https://arxiv.org/abs/2111.09886).
-#
-#     <Tip>
-#
-#     Note that we provide a script to pre-train this model on custom data in our [examples
-#     directory](https://github.com/huggingface/transformers/tree/main/examples/pytorch/image-pretraining).
-#
-#     </Tip>
-#     """,
-#     UNETR_START_DOCSTRING,
-# )
-# Copied from transformers.models.vit.modeling_vit.ViTForMaskedImageModeling with VIT->UNETR,ViT->UNETR,vit->unetr,google/vit-base-patch16-224-in21k->nvidia/unetr
-# class UNETRForMaskedImageModeling(UNETRPreTrainedModel):
-#     def __init__(self, config: UNETRConfig) -> None:
-#         super().__init__(config)
-#
-#         self.unetr = UNETRModel(config, add_pooling_layer=False, use_mask_token=True)
-#
-#         self.decoder = nn.Sequential(
-#             nn.Conv2d(
-#                 in_channels=config.hidden_size,
-#                 out_channels=config.encoder_stride**2 * config.num_channels,
-#                 kernel_size=1,
-#             ),
-#             nn.PixelShuffle(config.encoder_stride),
-#         )
-#
-#         # Initialize weights and apply final processing
-#         self.post_init()
-#
-#     @add_start_docstrings_to_model_forward(UNETR_INPUTS_DOCSTRING)
-#     @replace_return_docstrings(output_type=MaskedLMOutput, config_class=_CONFIG_FOR_DOC)
-#     def forward(
-#         self,
-#         pixel_values: Optional[torch.Tensor] = None,
-#         bool_masked_pos: Optional[torch.BoolTensor] = None,
-#         head_mask: Optional[torch.Tensor] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         interpolate_pos_encoding: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#     ) -> Union[tuple, MaskedLMOutput]:
-#         r"""
-#         bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, num_patches)`):
-#             Boolean masked positions. Indicates which patches are masked (1) and which aren't (0).
-#
-#         Returns:
-#
-#         Examples:
-#         ```python
-#         >>> from transformers import ViTFeatureExtractor, UNETRForMaskedImageModeling
-#         >>> import torch
-#         >>> from PIL import Image
-#         >>> import requests
-#
-#         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-#         >>> image = Image.open(requests.get(url, stream=True).raw)
-#
-#         >>> feature_extractor = ViTFeatureExtractor.from_pretrained("nvidia/unetr")
-#         >>> model = UNETRForMaskedImageModeling.from_pretrained("nvidia/unetr")
-#
-#         >>> num_patches = (model.config.image_size // model.config.patch_size) ** 2
-#         >>> pixel_values = feature_extractor(images=image, return_tensors="pt").pixel_values
-#         >>> # create random boolean mask of shape (batch_size, num_patches)
-#         >>> bool_masked_pos = torch.randint(low=0, high=2, size=(1, num_patches)).bool()
-#
-#         >>> outputs = model(pixel_values, bool_masked_pos=bool_masked_pos)
-#         >>> loss, reconstructed_pixel_values = outputs.loss, outputs.logits
-#         >>> list(reconstructed_pixel_values.shape)
-#         [1, 3, 224, 224]
-#         ```"""
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-#
-#         outputs = self.unetr(
-#             pixel_values,
-#             bool_masked_pos=bool_masked_pos,
-#             head_mask=head_mask,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             interpolate_pos_encoding=interpolate_pos_encoding,
-#             return_dict=return_dict,
-#         )
-#
-#         sequence_output = outputs[0]
-#
-#         # Reshape to (batch_size, num_channels, height, width)
-#         sequence_output = sequence_output[:, 1:]
-#         batch_size, sequence_length, num_channels = sequence_output.shape
-#         height = width = math.floor(sequence_length**0.5)
-#         sequence_output = sequence_output.permute(0, 2, 1).reshape(batch_size, num_channels, height, width)
-#
-#         # Reconstruct pixel values
-#         reconstructed_pixel_values = self.decoder(sequence_output)
-#
-#         masked_im_loss = None
-#         if bool_masked_pos is not None:
-#             size = self.config.image_size // self.config.patch_size
-#             bool_masked_pos = bool_masked_pos.reshape(-1, size, size)
-#             mask = (
-#                 bool_masked_pos.repeat_interleave(self.config.patch_size, 1)
-#                 .repeat_interleave(self.config.patch_size, 2)
-#                 .unsqueeze(1)
-#                 .contiguous()
-#             )
-#             reconstruction_loss = nn.functional.l1_loss(pixel_values, reconstructed_pixel_values, reduction="none")
-#             masked_im_loss = (reconstruction_loss * mask).sum() / (mask.sum() + 1e-5) / self.config.num_channels
-#
-#         if not return_dict:
-#             output = (reconstructed_pixel_values,) + outputs[1:]
-#             return ((masked_im_loss,) + output) if masked_im_loss is not None else output
-#
-#         return MaskedLMOutput(
-#             loss=masked_im_loss,
-#             logits=reconstructed_pixel_values,
-#             hidden_states=outputs.hidden_states,
-#             attentions=outputs.attentions,
-#         )
-#
-#
-# @add_start_docstrings(
-#     """
-#     UNETR Model transformer with an image classification head on top (a linear layer on top of the final hidden state of
-#     the [CLS] token) e.g. for ImageNet.
-#
-#     <Tip>
-#
-#         Note that it's possible to fine-tune UNETR on higher resolution images than the ones it has been trained on, by
-#         setting `interpolate_pos_encoding` to `True` in the forward of the model. This will interpolate the pre-trained
-#         position embeddings to the higher resolution.
-#
-#     </Tip>
-#     """,
-#     UNETR_START_DOCSTRING,
-# )
-# # Copied from transformers.models.vit.modeling_vit.ViTForImageClassification with VIT->UNETR,ViT->UNETR,vit->unetr
-# class UNETRForImageClassification(UNETRPreTrainedModel):
-#     def __init__(self, config: UNETRConfig) -> None:
-#         super().__init__(config)
-#
-#         self.num_labels = config.num_labels
-#         self.unetr = UNETRModel(config, add_pooling_layer=False)
-#
-#         # Classifier head
-#         self.classifier = nn.Linear(config.hidden_size, config.num_labels) if config.num_labels > 0 else nn.Identity()
-#
-#         # Initialize weights and apply final processing
-#         self.post_init()
-#
-#     @add_start_docstrings_to_model_forward(UNETR_INPUTS_DOCSTRING)
-#     @add_code_sample_docstrings(
-#         processor_class=_FEAT_EXTRACTOR_FOR_DOC,
-#         checkpoint=_IMAGE_CLASS_CHECKPOINT,
-#         output_type=ImageClassifierOutput,
-#         config_class=_CONFIG_FOR_DOC,
-#         expected_output=_IMAGE_CLASS_EXPECTED_OUTPUT,
-#     )
-#     def forward(
-#         self,
-#         pixel_values: Optional[torch.Tensor] = None,
-#         head_mask: Optional[torch.Tensor] = None,
-#         labels: Optional[torch.Tensor] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         interpolate_pos_encoding: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#     ) -> Union[tuple, ImageClassifierOutput]:
-#         r"""
-#         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-#             Labels for computing the image classification/regression loss. Indices should be in `[0, ...,
-#             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-#             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-#         """
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-#
-#         outputs = self.unetr(
-#             pixel_values,
-#             head_mask=head_mask,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             interpolate_pos_encoding=interpolate_pos_encoding,
-#             return_dict=return_dict,
-#         )
-#
-#         sequence_output = outputs[0]
-#
-#         logits = self.classifier(sequence_output[:, 0, :])
-#
-#         loss = None
-#         if labels is not None:
-#             if self.config.problem_type is None:
-#                 if self.num_labels == 1:
-#                     self.config.problem_type = "regression"
-#                 elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-#                     self.config.problem_type = "single_label_classification"
-#                 else:
-#                     self.config.problem_type = "multi_label_classification"
-#
-#             if self.config.problem_type == "regression":
-#                 loss_fct = MSELoss()
-#                 if self.num_labels == 1:
-#                     loss = loss_fct(logits.squeeze(), labels.squeeze())
-#                 else:
-#                     loss = loss_fct(logits, labels)
-#             elif self.config.problem_type == "single_label_classification":
-#                 loss_fct = CrossEntropyLoss()
-#                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-#             elif self.config.problem_type == "multi_label_classification":
-#                 loss_fct = BCEWithLogitsLoss()
-#                 loss = loss_fct(logits, labels)
-#
-#         if not return_dict:
-#             output = (logits,) + outputs[1:]
-#             return ((loss,) + output) if loss is not None else output
-#
-#         return ImageClassifierOutput(
-#             loss=loss,
-#             logits=logits,
-#             hidden_states=outputs.hidden_states,
-#             attentions=outputs.attentions,
-#         )
-
 class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
     def __init__(self, config: UNETRConfig) -> None:
         super().__init__(config)
 
         self.unetr = UNETRModel(config, add_pooling_layer=False, use_mask_token=True)
+        self.config = config
+        feat_size = config.image_size // config.patch_size
+        self.feat_size = (feat_size, feat_size, feat_size)
 
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=3,
             in_channels=config.num_channels,
-            out_channels=config.patch_size, #Todo: this number is 16 but i am not sure if it is the patch_size
+            out_channels=config.patch_size,
             kernel_size=3,
             stride=1,
             norm_name=config.norm_name,
@@ -855,7 +638,7 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         self.encoder2 = UnetrPrUpBlock(
             spatial_dims=3,
             in_channels=config.hidden_size,
-            out_channels=config.feature_size * 2,
+            out_channels=config.patch_size * 2,
             num_layer=2,
             kernel_size=3,
             stride=1,
@@ -867,7 +650,7 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         self.encoder3 = UnetrPrUpBlock(
             spatial_dims=3,
             in_channels=config.hidden_size,
-            out_channels=config.feature_size * 4,
+            out_channels=config.patch_size * 4,
             num_layer=1,
             kernel_size=3,
             stride=1,
@@ -879,7 +662,7 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         self.encoder4 = UnetrPrUpBlock(
             spatial_dims=3,
             in_channels=config.hidden_size,
-            out_channels=config.feature_size * 8,
+            out_channels=config.patch_size * 8,
             num_layer=0,
             kernel_size=3,
             stride=1,
@@ -891,7 +674,7 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         self.decoder5 = UnetrUpBlock(
             spatial_dims=3,
             in_channels=config.hidden_size,
-            out_channels=config.feature_size * 8,
+            out_channels=config.patch_size * 8,
             kernel_size=3,
             upsample_kernel_size=2,
             norm_name=config.norm_name,
@@ -899,8 +682,8 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         )
         self.decoder4 = UnetrUpBlock(
             spatial_dims=3,
-            in_channels=config.feature_size * 8,
-            out_channels=config.feature_size * 4,
+            in_channels=config.patch_size * 8,
+            out_channels=config.patch_size * 4,
             kernel_size=3,
             upsample_kernel_size=2,
             norm_name=config.norm_name,
@@ -908,8 +691,8 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         )
         self.decoder3 = UnetrUpBlock(
             spatial_dims=3,
-            in_channels=config.feature_size * 4,
-            out_channels=config.feature_size * 2,
+            in_channels=config.patch_size * 4,
+            out_channels=config.patch_size * 2,
             kernel_size=3,
             upsample_kernel_size=2,
             norm_name=config.norm_name,
@@ -917,16 +700,22 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         )
         self.decoder2 = UnetrUpBlock(
             spatial_dims=3,
-            in_channels=config.feature_size * 2,
-            out_channels=config.feature_size,
+            in_channels=config.patch_size * 2,
+            out_channels=config.patch_size,
             kernel_size=3,
             upsample_kernel_size=2,
             norm_name=config.norm_name,
             res_block=config.res_block,
         )
-        self.out = UnetOutBlock(spatial_dims=3, in_channels=config.feature_size, out_channels=config.out_channels)
+        self.out = UnetOutBlock(spatial_dims=3, in_channels=config.patch_size, out_channels=config.out_channels)
         # Initialize weights and apply final processing
         self.post_init()
+
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
 
     @add_start_docstrings_to_model_forward(UNETR_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=MaskedLMOutput, config_class=_CONFIG_FOR_DOC)
@@ -936,7 +725,7 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         bool_masked_pos: Optional[torch.BoolTensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = True,
         interpolate_pos_encoding: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[tuple, MaskedLMOutput]:
@@ -980,64 +769,22 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
             interpolate_pos_encoding=interpolate_pos_encoding,
             return_dict=return_dict,
         )
-        #TODO: To review sizes use the following piece of code:
-        #TODO: What means with torch.no_grad()
-        """
-        from transformers import ViTFeatureExtractor, ViTForImageClassification
-        import torch
-        from datasets import load_dataset
 
-        dataset = load_dataset("huggingface/cats-image")
-        image = dataset["test"]["image"][0]
+        hidden_states_out = outputs.hidden_states[0:-1]
+        x = outputs.hidden_states[-1]
 
-        feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224")
-        model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224")
+        enc1 = self.encoder1(pixel_values)
+        x2 = hidden_states_out[3]
+        enc2 = self.encoder2(self.proj_feat(x2, self.config.hidden_size, self.feat_size))
+        x3 = hidden_states_out[6]
+        enc3 = self.encoder3(self.proj_feat(x3, self.config.hidden_size, self.feat_size))
+        x4 = hidden_states_out[9]
+        enc4 = self.encoder4(self.proj_feat(x4, self.config.hidden_size, self.feat_size))
+        dec4 = self.proj_feat(x, self.config.hidden_size, self.feat_size)
+        dec3 = self.decoder5(dec4, enc4)
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+        out = self.decoder2(dec1, enc1)
+        logits = self.out(out)
 
-        inputs = feature_extractor(image, return_tensors="pt")
-
-        with torch.no_grad():
-            logits = model(**inputs).logits
-
-        # model predicts one of the 1000 ImageNet classes
-        predicted_label = logits.argmax(-1).item()
-        print(model.config.id2label[predicted_label])
-        Egyptian cat
-        """
-
-        sequence_output = outputs[0]
-
-        # Reshape to (batch_size, num_channels, height, width)
-        sequence_output = sequence_output[:, 1:]
-        batch_size, sequence_length, num_channels = sequence_output.shape
-        height = width = math.floor(sequence_length**0.5)
-        sequence_output = sequence_output.permute(0, 2, 1).reshape(batch_size, num_channels, height, width)
-
-        # Reconstruct pixel values
-        reconstructed_pixel_values = self.decoder(sequence_output)
-
-        masked_im_loss = None
-        if bool_masked_pos is not None:
-            size = self.config.image_size // self.config.patch_size
-            bool_masked_pos = bool_masked_pos.reshape(-1, size, size)
-            mask = (
-                bool_masked_pos.repeat_interleave(self.config.patch_size, 1)
-                .repeat_interleave(self.config.patch_size, 2)
-                .unsqueeze(1)
-                .contiguous()
-            )
-            reconstruction_loss = nn.functional.l1_loss(pixel_values, reconstructed_pixel_values, reduction="none")
-            masked_im_loss = (reconstruction_loss * mask).sum() / (mask.sum() + 1e-5) / self.config.num_channels
-
-        if not return_dict:
-            output = (reconstructed_pixel_values,) + outputs[1:]
-            return ((masked_im_loss,) + output) if masked_im_loss is not None else output
-
-        return MaskedLMOutput(
-            loss=masked_im_loss,
-            logits=reconstructed_pixel_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
-
+        return logits

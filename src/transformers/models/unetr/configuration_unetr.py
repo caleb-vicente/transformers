@@ -102,13 +102,16 @@ class UNETRConfig(PretrainedConfig):
         initializer_range=0.02,
         layer_norm_eps=1e-12,
         is_encoder_decoder=False,
-        image_size=224,
+        image_size=96,
         patch_size=16,
-        num_channels=3,
-        qkv_bias=True,
+        num_channels=1,
+        out_channels=14,
+        qkv_bias=False,
         encoder_stride=16,
         norm_name: Union[Tuple, str]="instance",
+        conv_block=True,
         res_block=True,
+        spatial_dims=3,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -125,11 +128,13 @@ class UNETRConfig(PretrainedConfig):
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_channels = num_channels
+        self.out_channels = out_channels
         self.qkv_bias = qkv_bias
         self.encoder_stride = encoder_stride
         self.norm_name = norm_name
+        self.conv_block = conv_block
         self.res_block = res_block
-
+        self.spatial_dims = spatial_dims #TODO: Add description. this was added because it was in the monai project
 
 class UNETROnnxConfig(OnnxConfig):
 
