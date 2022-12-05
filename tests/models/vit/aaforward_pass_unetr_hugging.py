@@ -1,11 +1,10 @@
 import os
 import argparse
-from transformers import UNETRModel, UNETRConfig, UNETRFor3DImageSegmentation
+from transformers import UNETRConfig, UNETRFor3DImageSegmentation
 import torch
 
 
 config = UNETRConfig()
-#model = UNETRModel(config, add_pooling_layer=False, use_mask_token=True)
 model = UNETRFor3DImageSegmentation(config)
 
 # Import 3D images for Unetr

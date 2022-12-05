@@ -17,12 +17,11 @@
 import numpy as np
 import collections.abc
 import math
-from typing import Dict, List, Optional, Set, Tuple, Union, Sequence
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 # TODO: Remove monai dependences
 from monai.utils import optional_import
@@ -31,7 +30,7 @@ from monai.networks.blocks.dynunet_block import UnetOutBlock
 
 
 from ...activations import ACT2FN
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ImageClassifierOutput, MaskedLMOutput
+from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, MaskedLMOutput
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from ...utils import (
