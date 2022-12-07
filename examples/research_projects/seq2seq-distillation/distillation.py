@@ -5,7 +5,6 @@ import gc
 import os
 import sys
 from pathlib import Path
-from typing import List
 
 import pytorch_lightning as pl
 import torch
@@ -86,7 +85,7 @@ class SummarizationDistiller(SummarizationModule):
         if d_layer_ids is None:
             d_layer_ids = list(range(student_decoder_layers))
 
-        self.e_layer_ids, self.d_layer_ids = e_layer_ids, d_layer_ids  # type: List[int], List[int]
+        self.e_layer_ids, self.d_layer_ids = e_layer_ids, d_layer_ids
 
         if self.do_calc_hidden_loss:  # Intermediate supervision: Decide which layers to supervise
             if hparams.supervise_forward:
