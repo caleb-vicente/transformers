@@ -30,7 +30,7 @@ if is_torch_available():
     import torch
     from torch import nn
 
-    from transformers import UNETRForImageClassification, UNETRForMaskedImageModeling, UNETRModel
+    from transformers import UNETRFor3DImageSegmentation, UNETRModel
     from transformers.models.unetr.modeling_unetr import UNETR_PRETRAINED_MODEL_ARCHIVE_LIST
 
 
@@ -44,14 +44,15 @@ class UNETRModelTester:
     def __init__(
         self,
         parent,
-        batch_size=13,
-        image_size=30,
-        patch_size=2,
-        num_channels=3,
+        batch_size=1,
+        image_size=96,
+        patch_size=16,
+        num_channels=1,
+        out_channels=16,
         is_training=True,
         use_labels=True,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=12,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -61,12 +62,14 @@ class UNETRModelTester:
         initializer_range=0.02,
         scope=None,
         encoder_stride=2,
+
     ):
         self.parent = parent
         self.batch_size = batch_size
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_channels = num_channels
+        self.out_channels = out_channels
         self.is_training = is_training
         self.use_labels = use_labels
         self.hidden_size = hidden_size
@@ -82,11 +85,11 @@ class UNETRModelTester:
         self.encoder_stride = encoder_stride
 
         # in UNETR, the seq length equals the number of patches + 1 (we add 1 for the [CLS] token)
-        num_patches = (image_size // patch_size) ** 2
-        self.seq_length = num_patches + 1
+        num_patches = (image_size // patch_size) ** 3
+        self.seq_length = num_patches
 
     def prepare_config_and_inputs(self):
-        pixel_values = floats_tensor([self.batch_size, self.num_channels, self.image_size, self.image_size])
+        pixel_values = floats_tensor([self.batch_size, self.num_channels, self.image_size, self.image_size, self.image_size])
 
         labels = None
         if self.use_labels:
@@ -101,6 +104,7 @@ class UNETRModelTester:
             image_size=self.image_size,
             patch_size=self.patch_size,
             num_channels=self.num_channels,
+            out_channels=self.out_channels,
             hidden_size=self.hidden_size,
             num_hidden_layers=self.num_hidden_layers,
             num_attention_heads=self.num_attention_heads,
@@ -117,45 +121,17 @@ class UNETRModelTester:
         model = UNETRModel(config=config)
         model.to(torch_device)
         model.eval()
-        result = model(pixel_values)
+        result = model(pixel_values, output_hidden_states=True)
         self.parent.assertEqual(result.last_hidden_state.shape, (self.batch_size, self.seq_length, self.hidden_size))
 
-    def create_and_check_for_masked_image_modeling(self, config, pixel_values, labels):
-        model = UNETRForMaskedImageModeling(config=config)
+    def create_and_check_for_3d_image_segmentation(self, config, pixel_values, labels):
+        model = UNETRFor3DImageSegmentation(config=config)
         model.to(torch_device)
         model.eval()
         result = model(pixel_values)
         self.parent.assertEqual(
-            result.logits.shape, (self.batch_size, self.num_channels, self.image_size, self.image_size)
+            result.logits.shape, (self.batch_size, self.out_channels, self.image_size, self.image_size, self.image_size)
         )
-
-        # test greyscale images
-        config.num_channels = 1
-        model = UNETRForMaskedImageModeling(config)
-        model.to(torch_device)
-        model.eval()
-
-        pixel_values = floats_tensor([self.batch_size, 1, self.image_size, self.image_size])
-        result = model(pixel_values)
-        self.parent.assertEqual(result.logits.shape, (self.batch_size, 1, self.image_size, self.image_size))
-
-    def create_and_check_for_image_classification(self, config, pixel_values, labels):
-        config.num_labels = self.type_sequence_label_size
-        model = UNETRForImageClassification(config)
-        model.to(torch_device)
-        model.eval()
-        result = model(pixel_values, labels=labels)
-        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.type_sequence_label_size))
-
-        # test greyscale images
-        config.num_channels = 1
-        model = UNETRForImageClassification(config)
-        model.to(torch_device)
-        model.eval()
-
-        pixel_values = floats_tensor([self.batch_size, 1, self.image_size, self.image_size])
-        result = model(pixel_values)
-        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.type_sequence_label_size))
 
     def prepare_config_and_inputs_for_common(self):
         config_and_inputs = self.prepare_config_and_inputs()
@@ -178,8 +154,7 @@ class UNETRModelTest(ModelTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             UNETRModel,
-            UNETRForImageClassification,
-            UNETRForMaskedImageModeling,
+            UNETRFor3DImageSegmentation,
         )
         if is_torch_available()
         else ()
@@ -226,22 +201,19 @@ class UNETRModelTest(ModelTesterMixin, unittest.TestCase):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_model(*config_and_inputs)
 
-    def test_for_masked_image_modeling(self):
+    def test_for_3d_image_segmentation(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
-        self.model_tester.create_and_check_for_masked_image_modeling(*config_and_inputs)
+        self.model_tester.create_and_check_for_3d_image_segmentation(*config_and_inputs)
 
-    def test_for_image_classification(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs()
-        self.model_tester.create_and_check_for_image_classification(*config_and_inputs)
-
-    @slow
+    # @slow
     def test_model_from_pretrained(self):
-        for model_name in UNETR_PRETRAINED_MODEL_ARCHIVE_LIST[:1]:
-            model = UNETRModel.from_pretrained(model_name)
-            self.assertIsNotNone(model)
+        model_name = UNETR_PRETRAINED_MODEL_ARCHIVE_LIST[0]
+        # todo: two model_names has been implemented. (unetrmodel and unetrmodelsforsegementation) should they be the same?
+        # todo: send message to hugging face people
+        model = UNETRModel.from_pretrained(model_name)
+        self.assertIsNotNone(model)
 
 
-# We will verify our results on an image of cute cats
 def prepare_img():
     image = Image.open("./tests/fixtures/tests_samples/COCO/000000039769.png")
     return image

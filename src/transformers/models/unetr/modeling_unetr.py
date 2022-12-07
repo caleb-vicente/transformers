@@ -14,7 +14,6 @@
 # limitations under the License.
 """ PyTorch UNETR model."""
 
-import numpy as np
 import collections.abc
 import math
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -30,7 +29,7 @@ from monai.networks.blocks.dynunet_block import UnetOutBlock
 
 
 from ...activations import ACT2FN
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, MaskedLMOutput
+from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, MaskedLMOutput, SemanticSegmenterOutput
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from ...utils import (
@@ -60,7 +59,8 @@ _IMAGE_CLASS_EXPECTED_OUTPUT = "Egyptian cat"
 
 
 UNETR_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "nvidia/unetr",
+    "Caleb98/unetr",
+    "Caleb98/UNETRForImageClassification",
     # See all VIT models at https://huggingface.co/models?filter=unetr
 ]
 
@@ -159,7 +159,7 @@ class UNETRPatchEmbeddings(nn.Module):
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.num_patches = num_patches
-        self.patch_dim = num_channels * np.prod(patch_size)
+        self.patch_dim = num_channels * math.prod(patch_size)
 
         #self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
         chars = (("h", "p1"), ("w", "p2"), ("d", "p3"))[:config.spatial_dims]
@@ -517,7 +517,7 @@ UNETR_INPUTS_DOCSTRING = r"""
 )
 # Copied from transformers.models.vit.modeling_vit.ViTModel with VIT->UNETR,ViT->UNETR
 class UNETRModel(UNETRPreTrainedModel):
-    def __init__(self, config: UNETRConfig, add_pooling_layer: bool = True, use_mask_token: bool = False):
+    def __init__(self, config: UNETRConfig, add_pooling_layer: bool = False, use_mask_token: bool = False):
         super().__init__(config)
         self.config = config
 
@@ -531,14 +531,6 @@ class UNETRModel(UNETRPreTrainedModel):
 
     def get_input_embeddings(self) -> UNETRPatchEmbeddings:
         return self.embeddings.patch_embeddings
-
-    def _prune_heads(self, heads_to_prune: Dict[int, List[int]]) -> None:
-        """
-        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
-        class PreTrainedModel
-        """
-        for layer, heads in heads_to_prune.items():
-            self.encoder.layer[layer].attention.prune_heads(heads)
 
     @add_start_docstrings_to_model_forward(UNETR_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -786,4 +778,6 @@ class UNETRFor3DImageSegmentation(UNETRPreTrainedModel):
         out = self.decoder2(dec1, enc1)
         logits = self.out(out)
 
-        return logits
+        return SemanticSegmenterOutput(logits=logits,
+                                       hidden_states=hidden_states_out,
+                                       attentions=output_attentions)

@@ -112,6 +112,7 @@ class UNETRConfig(PretrainedConfig):
         conv_block=True,
         res_block=True,
         spatial_dims=3,
+        output_hidden_states=True,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -135,6 +136,7 @@ class UNETRConfig(PretrainedConfig):
         self.conv_block = conv_block
         self.res_block = res_block
         self.spatial_dims = spatial_dims #TODO: Add description. this was added because it was in the monai project
+        self.output_hidden_states = output_hidden_states
 
 class UNETROnnxConfig(OnnxConfig):
 
