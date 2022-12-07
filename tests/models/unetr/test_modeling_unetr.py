@@ -228,7 +228,7 @@ class UNETRModelIntegrationTest(unittest.TestCase):
 
     @slow
     def test_inference_image_classification_head(self):
-        model = UNETRForImageClassification.from_pretrained("google/unetr-base-patch16-224").to(torch_device)
+        model = UNETRFor3DImageSegmentation.from_pretrained("google/unetr-base-patch16-224").to(torch_device)
 
         feature_extractor = self.default_feature_extractor
         image = prepare_img()
